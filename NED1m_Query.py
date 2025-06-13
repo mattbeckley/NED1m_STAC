@@ -43,7 +43,7 @@ import tarfile # For creating the output tar.gz file
 #   --maxlat             Maximum latitude of the AOI (EPSG:4326).
 #   --output_dir         Base directory for all outputs (logs, temp files, final raster).
 #                        This directory MUST exist.
-#   --OutputFormat       The desired output format for the raster ('GTiff', 'AAIGrid', 'HFA').
+#   --output_format       The desired output format for the raster ('GTiff', 'AAIGrid', 'HFA').
 #   --keep_temp_files    If specified, temporary files (VSI URL list, VRT) will not be deleted.
 #   --force_local_stac   If specified, bypass the USGS Product API and use only the
 #                        local STAC catalog.
@@ -70,7 +70,7 @@ import tarfile # For creating the output tar.gz file
 # 6. Error Handling & Reporting: Includes try-except blocks, logs errors.
 # 7. Cleanup: By default, deletes temporary VSI URL list and VRT files.
 #
-# Last Substantial Modification: 2025-06-10
+# Last Substantial Modification: 2025-06-11
 #
 # -----------------------------------------------------------------------------
 
@@ -104,7 +104,7 @@ class Config:
     AOI_VSI_URL_LIST_FILE_NAME = 'AOI_tiff_VSI_URLs.txt' # For GDAL VSI paths
     OUTPUT_S3_URL_LIST_FILE_NAME = 'Original_USGS1mTiles_URLs.txt' # For original S3 HTTPS URLs
     TEMP_VRT_FILE_NAME = 'tmp.vrt'
-    OUTPUT_TARBALL_NAME = 'output.tar.gz'
+    OUTPUT_TARBALL_NAME = 'rasters_USGS1m.tar.gz'
 
     #Log settings can be set to: DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOG_LEVEL = logging.INFO
@@ -300,6 +300,12 @@ def find_files_local_indexed(catalog_path: Path, search_bbox_4326, index_name: s
                             elif asset_href_raw.startswith('s3://prd-tnm'):
                                 s3_https_url = asset_href_raw.replace('s3://prd-tnm', 'https://prd-tnm.s3.amazonaws.com')
                                 gdal_vsi_url = asset_href_raw.replace('s3://','/vsis3/')
+                            elif asset_href_raw.startswith('https://rockyweb.usgs.gov/vdelivery/Datasets/Staged/'):
+                                logger.debug(f"Handling rockyweb.usgs.gov URL for item {item.id}")
+                                rocky_prefix = 'https://rockyweb.usgs.gov/vdelivery/Datasets/Staged/'
+                                path_suffix = asset_href_raw[len(rocky_prefix):]
+                                gdal_vsi_url = f"/vsis3/prd-tnm/StagedProducts/{path_suffix}"
+                                s3_https_url = f"https://prd-tnm.s3.amazonaws.com/StagedProducts/{path_suffix}"
                             elif asset_href_raw.startswith('/vsis3/prd-tnm'):
                                 gdal_vsi_url = asset_href_raw
                                 s3_https_url = gdal_vsi_url.replace('/vsis3/prd-tnm', 'https://prd-tnm.s3.amazonaws.com')
@@ -339,7 +345,6 @@ def find_files_local_indexed(catalog_path: Path, search_bbox_4326, index_name: s
 def main(cli_args):
     """Main execution function, using parsed CLI arguments."""
 
-    # --- New: Map for output formats ---
     FORMAT_MAP = {
         'GTIFF': {'driver': 'GTiff', 'ext': '.tif'},
         'AAIGRID': {'driver': 'AAIGrid', 'ext': '.asc'},
@@ -354,7 +359,7 @@ def main(cli_args):
     Config.OUTPUT_BASE_DIR = Path(cli_args.output_dir)
     Config.KEEP_TEMP_FILES = cli_args.keep_temp_files
     Config.FORCE_LOCAL_STAC = cli_args.force_local_stac
-    selected_format_key = cli_args.OutputFormat.upper()
+    selected_format_key = cli_args.output_format.upper()
 
     log_file_path = Config.OUTPUT_BASE_DIR / f"processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     setup_logging(log_file_path, Config.LOG_LEVEL)
@@ -435,7 +440,7 @@ def main(cli_args):
 
     format_info = FORMAT_MAP[selected_format_key]
     gdal_driver_name = format_info['driver']
-    output_basename = "output" # Base name for globbing later
+    output_basename = "output_USGS1m"
     primary_output_filename = output_basename + format_info['ext']
 
     out_vsi_url_list_file = Config.OUTPUT_BASE_DIR / Config.AOI_VSI_URL_LIST_FILE_NAME
@@ -489,8 +494,7 @@ def main(cli_args):
         if selected_format_key == 'GTIFF':
              cmd_gdal_translate_list.extend([
                 "-co", "COMPRESS=deflate", "-co", "TILED=YES",
-                "-co", "blockxsize=512", "-co", "blockysize=512",
-                "-co", "NUM_THREADS=ALL_CPUS"
+                "-co", "blockxsize=512", "-co", "blockysize=512"
             ])
         cmd_gdal_translate_list.append(str(primary_output_raster_file))
 
@@ -501,11 +505,11 @@ def main(cli_args):
         # --- New: Archive all generated files and then clean them up ---
         logger.info("\n--- Archiving results and cleaning up ---")
 
-        # Discover all files starting with "output."
+        # Discover all files starting with "output."        
         gdal_output_files = list(Config.OUTPUT_BASE_DIR.glob(f"{output_basename}.*"))
         files_to_archive_and_delete = gdal_output_files.copy()
 
-        # Add the URL list to the list of files to archive and delete
+        # Add the URL list to the list of files to archive and delete        
         if out_s3_https_url_list_file.exists():
             files_to_archive_and_delete.append(out_s3_https_url_list_file)
         else:
@@ -525,7 +529,7 @@ def main(cli_args):
                     tar.add(file_path, arcname=file_path.name)
             logger.info(f"Successfully created output tarball: {tarball_path}")
 
-            # Cleanup original files ONLY after successful tar creation
+            # Cleanup original files ONLY after successful tar creation            
             logger.info("Cleaning up original archived files...")
             for file_path in files_to_archive_and_delete:
                 try:
@@ -594,7 +598,7 @@ if __name__ == "__main__":
     # --- Configuration Arguments ---
     parser.add_argument("--output_dir", type=str, default=str(Config.DEFAULT_OUTPUT_BASE_DIR),
                         help="Base directory for all outputs. This directory MUST exist.")
-    parser.add_argument("--OutputFormat", type=str.upper, default='GTIFF',
+    parser.add_argument("--output_format", type=str.upper, default='GTIFF',
                         choices=['GTIFF', 'AAIGRID', 'HFA'],
                         help="The desired output format for the final raster file. Defaults to 'GTIFF'.")
     parser.add_argument("--keep_temp_files", action='store_true',

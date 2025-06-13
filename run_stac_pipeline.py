@@ -105,7 +105,7 @@ class Config:
 # --- Logging Setup ---
 current_date_str = datetime.now().strftime("%Y%m%d")
 LOG_FILE_NAME = f"stac_pipeline_{current_date_str}.log"
-LOG_FILE = Config.OUTPUT_DIRECTORY_BASE / LOG_FILE_NAME
+LOG_FILE = Config.OUTPUT_DIRECTORY_BASE / "logs" / LOG_FILE_NAME
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
