@@ -21,3 +21,9 @@ Create, Update, and Index a STAC catalog of USGS 1m COGs
   is supposed to loop through the entire STAC catalog and output the
   URLs to the geotiffs to a text file.  This would be used to
   troubleshoot if some of the URLs are incorrect.  Haven't tried it yet.
+- RasterNED1mService.py.  This is the version of code that is on production.  
+  This code is from: 
+  https://github.com/OpenTopography/Algorithms/blob/main/RasterNED1mService.py
+  last updated on 02/19/2026.  Note there are slight differences between this 
+  code and my local version.  Mainly paths, and how to do error logging.
+  
