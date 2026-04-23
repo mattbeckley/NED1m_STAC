@@ -36,11 +36,15 @@ multiple assets per item with different keys. Each item already has an
 `elevation-geotiff-osn`, will be added pointing to the OSN equivalent.
 One catalog, two URLs per tile, no duplication of structure.
 
-The URL transformation is straightforward since OSN is a mirror:
+The URL transformation drops the `StagedProducts/` prefix, since the rclone
+sync maps `prd-tnm/StagedProducts/Elevation/1m/` → `ot-usgs-osn/Elevation/1m/`:
 ```
-https://prd-tnm.s3.amazonaws.com/StagedProducts/...
-  → https://usgs.osn.mghpcc.org/ot-usgs-osn/StagedProducts/...
+https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/...
+  → https://usgs.osn.mghpcc.org/ot-usgs-osn/Elevation/1m/Projects/...
 ```
+
+OSN uses an S3-compatible API (Ceph) with path-style addressing and requires
+credentials. It is not publicly accessible over plain HTTPS.
 
 ---
 
@@ -118,6 +122,16 @@ A one-time migration (with dry-run and checkpointing support) that:
 
 ### 2a. Add OSN config constants
 Add endpoint, bucket name, and GDAL VSI path prefix for OSN to `Config`.
+OSN credentials (access key, secret key) must NOT be hardcoded. They will be
+read from a config file (e.g. `~/.config/ned1m/osn_credentials.ini` or an
+environment variable file) at runtime. The GDAL subprocess environment will be
+augmented with:
+- `AWS_S3_ENDPOINT=usgs.osn.mghpcc.org`
+- `AWS_ACCESS_KEY_ID=<from config>`
+- `AWS_SECRET_ACCESS_KEY=<from config>`
+- `AWS_VIRTUAL_HOSTING=FALSE` (required for path-style addressing)
+
+GDAL VSI path format for OSN: `/vsis3/ot-usgs-osn/Elevation/1m/Projects/...`
 
 ### 2b. Enrich `find_files_local_indexed` return value
 Modify to extract both assets from each STAC item, returning:

@@ -93,6 +93,14 @@ class Config:
     # Testing example: PROJECTS_TO_PROCESS = ["AZ_LowerColoradoRiver_2015", "LA_NortheastDOTD_2017_C20"]
     PROJECTS_TO_PROCESS = None
 
+    # OSN mirror settings
+    # The rclone sync maps prd-tnm/StagedProducts/Elevation/1m/ → ot-usgs-osn/Elevation/1m/
+    # so the StagedProducts/ prefix is dropped in OSN paths.
+    OSN_ENDPOINT = "https://usgs.osn.mghpcc.org"
+    OSN_BUCKET_NAME = "ot-usgs-osn"
+    OSN_BASE_URL = f"{OSN_ENDPOINT}/{OSN_BUCKET_NAME}/"
+    USGS_S3_PREFIX_IN_OSN = "StagedProducts/"  # this prefix is stripped when mapping to OSN
+
     #Log settings can be set to: DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOG_LEVEL = logging.INFO
 
@@ -232,9 +240,28 @@ def _parse_xml_to_stac_item_properties(xml_content, xml_key, s3_project_folder_p
         logger.error(f"Error parsing XML {xml_key}: {type(e).__name__} - {e}", exc_info=True)
         return None, None, None, None, None, None
 
+def _usgs_url_to_osn_url(usgs_https_url):
+    """
+    Converts a USGS prd-tnm S3 HTTPS URL to its OSN mirror equivalent.
+    The rclone sync strips the StagedProducts/ prefix:
+      https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/...
+      → https://usgs.osn.mghpcc.org/ot-usgs-osn/Elevation/1m/...
+    Returns None if the URL cannot be mapped.
+    """
+    usgs_prefix = f"{Config.S3_PUBLIC_BASE_URL}{Config.USGS_S3_PREFIX_IN_OSN}"
+    if usgs_https_url and usgs_https_url.startswith(usgs_prefix):
+        path_after_staged = usgs_https_url[len(usgs_prefix):]
+        return f"{Config.OSN_BASE_URL}{path_after_staged}"
+    return None
+
 def _create_stac_item(item_id, bbox, geometry_geojson, item_datetime_obj, properties, asset_href):
     item = pystac.Item(id=item_id, geometry=geometry_geojson, bbox=bbox, datetime=item_datetime_obj, properties=properties)
     item.add_asset("elevation-geotiff", pystac.Asset(href=asset_href, media_type=pystac.MediaType.COG, title="1m Elevation GeoTIFF", roles=["data", "elevation"]))
+    osn_url = _usgs_url_to_osn_url(asset_href)
+    if osn_url:
+        item.add_asset("elevation-geotiff-osn", pystac.Asset(href=osn_url, media_type=pystac.MediaType.COG, title="1m Elevation GeoTIFF (OSN mirror)", roles=["data", "elevation"]))
+    else:
+        logger.debug(f"Could not derive OSN URL for item {item_id}, asset href: {asset_href}")
     return item
 
 def _process_s3_project_folder(s3_client, s3_project_folder_prefix_str):
