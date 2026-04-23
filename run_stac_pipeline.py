@@ -159,6 +159,10 @@ def _parse_xml_to_stac_item_properties(xml_content, xml_key, s3_project_folder_p
         if not item_datetime_obj and "end_datetime" in properties:
              item_datetime_obj = datetime.fromisoformat(properties["end_datetime"].replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
 
+        if item_datetime_obj is None and "start_datetime" not in properties and "end_datetime" not in properties:
+            properties["start_datetime"] = None
+            properties["end_datetime"] = None
+
         https_url = ""
         networkr_lower = networkr_path.lower()
 

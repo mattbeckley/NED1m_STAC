@@ -10,7 +10,7 @@ set -e # Exit immediately if a command exits with a non-zero status.
 # --- Configuration ---
 SOURCE_DIR="/data/matt/NED1m_STAC"
 BACKUP_DIR="/data/matt/NED1m_STAC_BU"
-PYTHON_SCRIPT_PATH="/home/beckley/NED/NED1m/STAC/run_stac_pipeline.py"
+PYTHON_SCRIPT_PATH="/home/beckley/NED/NED1m_STAC/run_stac_pipeline.py"
 CONDA_PATH="/home/beckley/miniconda3" 
 
 # --- Script Start ---
