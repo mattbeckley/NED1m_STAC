@@ -1,6 +1,11 @@
 #ignore the dev folder
 dev/
 
+#ignore these files
+validator_output.txt
+MAB_README.txt
+cronoutput.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
