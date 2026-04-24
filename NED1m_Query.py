@@ -1,76 +1,116 @@
+import argparse
+import configparser
+import json
 import logging
 import os
+import pickle
+import re
 import subprocess
-import json
-import re # For regex in warning suppression
+import sys
+import tarfile
 from datetime import datetime
 from pathlib import Path
 import requests
-from urllib.parse import urlencode, quote # Import quote for custom encoding
-import pystac # For pystac.read_file
-from rtree import index # For R-tree spatial index
-import pickle # For loading the .pkl file for the R-tree index
-import sys # For sys.exit and stream handler logging
-import argparse # For command-line arguments
-import tarfile # For creating the output tar.gz file
+import pystac
+from rtree import index
 
 # GDAL/OGR operations are done via subprocess calls to GDAL binaries.
 
 # -----------------------------------------------------------------------------
-# Refined STAC Processing Script (USGS API & Local Fallback)
+# NED 1m Elevation Query Script
 # -----------------------------------------------------------------------------
 #
 # Purpose:
-# This script retrieves USGS 1-meter Digital Elevation Model (DEM) data for a
-# specified Area of Interest (AOI). It first attempts to use the USGS National
-# Map Product API. If that fails (e.g., server issues), it falls back to using
-# a pre-built local STAC (SpatioTemporal Asset Catalog) with an R-tree spatial
-# index for faster local queries. An option exists to force the use of the
-# local STAC catalog, bypassing the USGS API attempt.
+# Retrieves USGS 1-meter Digital Elevation Model (DEM) data for a specified
+# Area of Interest (AOI) from a local STAC catalog, then uses GDAL to produce
+# a subsetted output raster.
 #
-# The script then generates a VRT (Virtual Raster) from the identified GeoTIFF
-# URLs (using GDAL VSI paths) and uses gdal_translate to create a final raster
-# file subsetted to the AOI, in the user-specified format. It also outputs a
-# separate text file containing the original S3 HTTPS URLs for documentation.
-# Finally, it bundles all generated output files into a single gzipped tarball
-# and cleans up the original files.
+# Background — Why the USGS Product API was removed:
+# Earlier versions of this script used the USGS National Map Product API as the
+# primary data source, with the local STAC catalog as a fallback. The USGS API
+# proved too unreliable for production use (frequent timeouts, outages, and
+# inconsistent responses). The script now always uses the local STAC catalog,
+# which contains both USGS S3 URLs and OSN mirror URLs for every tile. A local
+# mirror of the USGS data on OSN (Open Storage Network) serves as the failover
+# when USGS S3 is unavailable.
+#
+# Each STAC item contains two assets:
+#   - elevation-geotiff     : public USGS S3 URL (https://prd-tnm.s3.amazonaws.com/...)
+#   - elevation-geotiff-osn : OSN mirror URL     (https://usgs.osn.mghpcc.org/...)
+#
+# Data Source Selection:
+# By default the script checks USGS S3 first and only fails over to OSN if
+# USGS is unreachable. Two override flags exist for testing and emergencies.
+#
+#   (default)             Perform a lightweight USGS health check (HEAD requests
+#                         on 2 sample URLs with a 5s timeout). If USGS responds
+#                         OK, use USGS S3 VSI paths. If the check fails or times
+#                         out, automatically fail over to OSN and log a warning.
+#   --force_local_stac    Skip health check; use USGS S3 VSI paths directly.
+#                         Use when USGS is known to be healthy and you want to
+#                         skip the small overhead of the health check.
+#   --force_osn           Skip health check; use OSN VSI paths directly. For
+#                         any tile missing an OSN asset, falls back to the USGS
+#                         VSI path and logs a warning.
+#
+# --force_local_stac and --force_osn are mutually exclusive.
+#
+# OSN Access:
+# OSN is not publicly accessible. When OSN paths are used, GDAL subprocesses
+# are given S3-compatible credentials via environment variables read from
+# Config.OSN_CREDENTIALS_FILE (an .ini file, never committed to git).
+#
+# Outputs (bundled into rasters_USGS1m.tar.gz):
+#   - output_USGS1m.tif/.asc/.img  : raster subsetted to the AOI
+#   - Original_USGS1mTiles_URLs.txt : public USGS S3 URLs for all source tiles.
+#     Always contains USGS URLs regardless of which internal source was used,
+#     with a comment line noting the retrieval mode for audit purposes.
+#
+# Temporary files (deleted by default, kept with --keep_temp_files):
+#   - AOI_tiff_VSI_URLs.txt : GDAL VSI paths passed to gdalbuildvrt
+#   - tmp.vrt               : virtual raster built from the VSI path list
 #
 # Command-Line Arguments:
-#   (Run with -h or --help to see all options and their defaults)
-#   --minlon             Minimum longitude of the AOI (EPSG:4326).
-#   --minlat             Minimum latitude of the AOI (EPSG:4326).
-#   --maxlon             Maximum longitude of the AOI (EPSG:4326).
-#   --maxlat             Maximum latitude of the AOI (EPSG:4326).
-#   --output_dir         Base directory for all outputs (logs, temp files, final raster).
-#                        This directory MUST exist.
-#   --output_format       The desired output format for the raster ('GTiff', 'AAIGrid', 'HFA').
-#   --keep_temp_files    If specified, temporary files (VSI URL list, VRT) will not be deleted.
-#   --force_local_stac   If specified, bypass the USGS Product API and use only the
-#                        local STAC catalog.
+#   --minlon FLOAT         Minimum longitude of the AOI (EPSG:4326).
+#                          Default: -74.00
+#   --minlat FLOAT         Minimum latitude of the AOI (EPSG:4326).
+#                          Default: 44.705843
+#   --maxlon FLOAT         Maximum longitude of the AOI (EPSG:4326).
+#                          Default: -73.8
+#   --maxlat FLOAT         Maximum latitude of the AOI (EPSG:4326).
+#                          Default: 44.782501
+#   --output_dir PATH      Directory for all outputs. Must already exist.
+#                          Default: /data/matt/testing/STAC1m/test1
+#   --output_format STR    Output raster format: GTIFF, AAIGRID, or HFA.
+#                          Default: GTIFF
+#   --keep_temp_files      If set, do not delete AOI_tiff_VSI_URLs.txt and
+#                          tmp.vrt after the run. Default: False (deleted).
+#   --stac_catalog_path PATH
+#                          Override the local STAC catalog path. Useful for
+#                          testing against a non-production catalog.
+#                          Default: /data/matt/NED1m_STAC/catalog.json
+#   --force_local_stac     Skip health check; use USGS S3 VSI paths from the
+#                          local STAC. Mutually exclusive with --force_osn.
+#                          Default: False
+#   --force_osn            Skip health check; use OSN VSI paths from the local
+#                          STAC. Falls back to USGS per tile if OSN asset is
+#                          missing. Mutually exclusive with --force_local_stac.
+#                          Default: False
 #
 # How it Works:
-# 1. Configuration & Argument Parsing: Script settings are defined in a `Config`
-#    class, which can be overridden by command-line arguments.
-# 2. Logging: Comprehensive logging to console and a daily log file.
-# 3. URL Retrieval:
-#    - If --force_local_stac is used, it directly queries the local STAC catalog.
-#    - Otherwise, it tries USGS Product API first.
-#    - If USGS API fails, it falls back to/uses the local STAC.
-#    - Returns a list of dictionaries, each containing a 'vsi' path for GDAL
-#      and the original 's3_https' URL if applicable.
-# 4. GDAL Processing:
-#    - Writes GDAL VSI paths to a temporary list file.
-#    - Writes original S3 HTTPS URLs to a separate persistent list file.
-#    - Calls `gdalbuildvrt` to create a VRT from the VSI path list.
-#    - Calls `gdal_translate` to subset the VRT to the AOI and output a raster
-#      in the specified format. This may create multiple files (e.g., .img, .img.aux.xml).
-# 5. Tarball Creation & Cleanup: Discovers all files generated by gdal_translate,
-#    bundles them with the S3 URL list into a single `output.tar.gz` file, and
-#    then deletes the original source files.
-# 6. Error Handling & Reporting: Includes try-except blocks, logs errors.
-# 7. Cleanup: By default, deletes temporary VSI URL list and VRT files.
+# 1. Parse arguments and configure logging to OUTPUT_DIR and stdout.
+# 2. Query the local STAC R-tree index for all tiles intersecting the AOI.
+#    Each result includes both USGS and OSN VSI paths.
+# 3. Select data source: default health check, or forced via flag (see above).
+# 4. Build the GDAL VSI path list and write USGS public URLs to the URL file.
+# 5. Run gdalbuildvrt to assemble a virtual mosaic from the VSI paths.
+# 6. Run gdal_translate to subset the mosaic to the AOI and write the output
+#    raster. OSN runs pass S3 credentials via subprocess environment variables.
+# 7. Bundle outputs into rasters_USGS1m.tar.gz and remove originals.
+# 8. Optionally clean up temporary files.
 #
-# Last Substantial Modification: 2025-06-11
+# Prerequisites: pystac, rtree, requests, gdal (via subprocess)
+# Last Substantial Modification: 2026-04-24
 #
 # -----------------------------------------------------------------------------
 
@@ -83,15 +123,20 @@ class Config:
     GDAL_TRANSLATE_BIN = Path("/home/beckley/miniconda3/envs/workGDAL3ten/bin/gdal_translate")
     GDAL_BUILDVRT_BIN = Path("/home/beckley/miniconda3/envs/workGDAL3ten/bin/gdalbuildvrt")
 
-    # USGS Product API Settings
-    USGS_API_URL_BASE = 'https://tnmaccess.nationalmap.gov/api/v1/products'
-    USGS_DATASET_NAME = 'Digital Elevation Model (DEM) 1 meter'
-    USGS_API_TIMEOUT_SEC = 60
-    USGS_API_MAX_RESULTS = 1000
-
     # Local STAC Catalog Settings
     LOCAL_STAC_CATALOG_PATH = Path("/data/matt/NED1m_STAC/catalog.json")
     LOCAL_STAC_INDEX_NAME = "stac_spatial_index"
+
+    # OSN mirror settings
+    OSN_ENDPOINT = "https://usgs.osn.mghpcc.org"
+    OSN_BUCKET_NAME = "ot-usgs-osn"
+    # OSN credentials file (must be created manually, never committed to git)
+    # Format: ini file with [osn] section containing access_key and secret_key
+    OSN_CREDENTIALS_FILE = Path("/data/matt/NED1m_STAC/osn_credentials.ini")
+
+    # USGS health check: HEAD request on this many sample URLs before each run
+    USGS_HEALTH_CHECK_TIMEOUT_SEC = 5
+    USGS_HEALTH_CHECK_SAMPLE_COUNT = 2
 
     # Default Input AOI (EPSG:4326)
     DEFAULT_MIN_LON = -74.00
@@ -101,20 +146,16 @@ class Config:
 
     # Default Output Directory and File Names
     DEFAULT_OUTPUT_BASE_DIR = Path("/data/matt/testing/STAC1m/test1")
-    AOI_VSI_URL_LIST_FILE_NAME = 'AOI_tiff_VSI_URLs.txt' # For GDAL VSI paths
-    OUTPUT_S3_URL_LIST_FILE_NAME = 'Original_USGS1mTiles_URLs.txt' # For original S3 HTTPS URLs
+    AOI_VSI_URL_LIST_FILE_NAME = 'AOI_tiff_VSI_URLs.txt'
+    OUTPUT_S3_URL_LIST_FILE_NAME = 'Original_USGS1mTiles_URLs.txt'
     TEMP_VRT_FILE_NAME = 'tmp.vrt'
     OUTPUT_TARBALL_NAME = 'rasters_USGS1m.tar.gz'
 
-    #Log settings can be set to: DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOG_LEVEL = logging.INFO
-
     HTTP_403_WARNING_PATTERN = r"Warning 1: HTTP response code on .*?: 403"
-
-    KEEP_TEMP_FILES = True # Temporary VSI URL list and VRT
-
-    #Set to True to bypass USGS Product API query and only use local STAC
-    FORCE_LOCAL_STAC = False
+    KEEP_TEMP_FILES = True
+    FORCE_LOCAL_STAC = False  # skip health check, use USGS VSI paths
+    FORCE_OSN = False         # skip health check, use OSN VSI paths
 
 
 # Global logger instance, will be configured in main()
@@ -146,12 +187,12 @@ def setup_logging(log_file_path, log_level):
 # Helper Functions
 # ----------------------------------------------------------------------
 
-def run_subprocess_command(command_args, suppress_403_warnings=False, log_prefix="SUBPROCESS"):
+def run_subprocess_command(command_args, suppress_403_warnings=False, log_prefix="SUBPROCESS", env=None):
     command_str = ' '.join(str(arg) for arg in command_args)
     logger.info(f"{log_prefix}: Running command: '{command_str}'")
     try:
         process = subprocess.run(
-            command_str, shell=True, capture_output=True, text=True, check=False
+            command_str, shell=True, capture_output=True, text=True, check=False, env=env
         )
         if process.stdout:
             for line in process.stdout.splitlines():
@@ -184,73 +225,55 @@ def bboxes_intersect(bbox1_minlon_minlat_maxlon_maxlat, bbox2_minlon_minlat_maxl
         return False
     return True
 
-def get_geotiff_urls(method_type, minlon, minlat, maxlon, maxlat, catalog_path_config: Path, search_index_name_config: str):
+def _get_osn_gdal_env():
     """
-    Retrieves GeoTIFF URLs.
-    Returns:
-        tuple: (list of dicts [{'vsi': ..., 's3_https': ...}], query_duration) or (None, None)
+    Reads OSN credentials and returns an env dict for GDAL subprocesses to
+    access OSN via S3 (path-style addressing, Ceph-compatible).
     """
-    query_start_time = datetime.now()
-    results_list = [] # List of {'vsi': ..., 's3_https': ...}
+    cfg = configparser.ConfigParser()
+    cfg.read(Config.OSN_CREDENTIALS_FILE)
+    try:
+        access_key = cfg['osn']['access_key']
+        secret_key = cfg['osn']['secret_key']
+    except KeyError as e:
+        logger.error(f"OSN credentials file missing key {e}. Expected [osn] section with "
+                     f"access_key and secret_key in {Config.OSN_CREDENTIALS_FILE}")
+        raise
+    return {
+        **os.environ,
+        'AWS_S3_ENDPOINT': 'usgs.osn.mghpcc.org',
+        'AWS_ACCESS_KEY_ID': access_key,
+        'AWS_SECRET_ACCESS_KEY': secret_key,
+        'AWS_VIRTUAL_HOSTING': 'FALSE',
+    }
 
-    if method_type == "USGS_API":
-        logger.info("Attempting URL retrieval via USGS Product API...")
-        try:
-            safe_params_to_encode = {
-                'datasets': Config.USGS_DATASET_NAME,
-                'prodFormats': 'GeoTIFF',
-                'outputFormat': 'JSON',
-                'max': Config.USGS_API_MAX_RESULTS
-            }
-            encoded_params = urlencode(safe_params_to_encode, quote_via=quote)
-            bbox_val_str = f"{minlon},{minlat},{maxlon},{maxlat}"
-            final_url = f"{Config.USGS_API_URL_BASE}?{encoded_params}&bbox={bbox_val_str}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            logger.info(f"USGS API Request URL to be sent: {final_url}")
-            r = requests.get(final_url, headers=headers, timeout=Config.USGS_API_TIMEOUT_SEC)
-            logger.info(f"USGS API Effective URL after request: {r.url}")
+
+def _check_usgs_accessible(sample_urls):
+    """
+    Does HEAD requests on up to USGS_HEALTH_CHECK_SAMPLE_COUNT USGS S3 URLs
+    with a short timeout. Returns True only if all sampled URLs respond successfully.
+    """
+    urls = [u for u in sample_urls if u][:Config.USGS_HEALTH_CHECK_SAMPLE_COUNT]
+    if not urls:
+        logger.warning("USGS health check: no sample URLs available, assuming accessible.")
+        return True
+    try:
+        for url in urls:
+            r = requests.head(url, timeout=Config.USGS_HEALTH_CHECK_TIMEOUT_SEC)
             r.raise_for_status()
-            data = r.json()
-            query_end_time = datetime.now()
-            items = data.get('items', [])
-            if not items:
-                logger.warning("USGS API returned no items for the query.")
-                return None, query_end_time - query_start_time
+        logger.info(f"USGS health check: OK ({len(urls)} URL(s) tested).")
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"USGS health check: FAILED ({e}).")
+        return False
 
-            for item in items:
-                s3_https_url = item.get("urls", {}).get("TIFF")
-                if s3_https_url:
-                    vsi_path = s3_https_url.replace('https://prd-tnm.s3.amazonaws.com','/vsis3/prd-tnm')
-                    results_list.append({'vsi': vsi_path, 's3_https': s3_https_url})
-
-            logger.info(f"USGS API found {len(results_list)} URLs.")
-            return results_list, query_end_time - query_start_time
-        except Exception as e: # Catching broad exceptions for brevity, specific ones are better
-            logger.error(f"Error during USGS API call: {type(e).__name__}: {e}", exc_info=True)
-        return None, datetime.now() - query_start_time
-
-    elif method_type == "LOCAL_STAC":
-        if not catalog_path_config or not search_index_name_config:
-            logger.error("Local STAC method requires catalog_path and search_index_name.")
-            return None, None
-        logger.info(f"Attempting URL retrieval via Local STAC catalog: {catalog_path_config}")
-        results_list = find_files_local_indexed(catalog_path_config, [minlon, minlat, maxlon, maxlat], search_index_name_config)
-        query_end_time = datetime.now()
-        if results_list: # find_files_local_indexed now returns the list of dicts
-            logger.info(f"Local STAC found {len(results_list)} URLs.")
-        else:
-            logger.warning("Local STAC search found no URLs or an error occurred.")
-        return results_list, query_end_time - query_start_time
-    else:
-        logger.error(f"Unknown URL retrieval method: {method_type}")
-        return None, None
 
 def find_files_local_indexed(catalog_path: Path, search_bbox_4326, index_name: str):
     """
     Searches a local STAC catalog using an R-tree index.
-    Returns a list of dictionaries: [{'vsi': gdal_vsi_url, 's3_https': s3_https_url_or_none}, ...]
+    Returns a list of dicts:
+      [{'vsi': usgs_vsi, 's3_https': usgs_https, 'osn_vsi': osn_vsi, 'osn_https': osn_https}, ...]
+    osn_vsi and osn_https are None for items that have no OSN asset.
     """
     logger.info(f"Running local STAC search on {catalog_path} using index {index_name}...")
     results_list = []
@@ -324,10 +347,13 @@ def find_files_local_indexed(catalog_path: Path, search_bbox_4326, index_name: s
                                 else:
                                     logger.warning(f"Asset href for item {item.id} ('{asset_href_raw}') is not a recognized S3 URL or existing local file ('{resolved_asset_path}'). Cannot form GDAL VSI path.")
 
-                            if gdal_vsi_url: # Only add if we could form a VSI path
-                                # Avoid duplicates based on VSI path
+                            if gdal_vsi_url:
                                 if not any(d['vsi'] == gdal_vsi_url for d in results_list):
-                                    results_list.append({'vsi': gdal_vsi_url, 's3_https': s3_https_url})
+                                    osn_asset = item.assets.get("elevation-geotiff-osn")
+                                    osn_https = osn_asset.href if osn_asset else None
+                                    osn_vsi = osn_https.replace(f"{Config.OSN_ENDPOINT}/", "/vsis3/") if osn_https else None
+                                    results_list.append({'vsi': gdal_vsi_url, 's3_https': s3_https_url,
+                                                         'osn_vsi': osn_vsi, 'osn_https': osn_https})
             except Exception as e:
                 logger.error(f"Error processing STAC item {item_id} from {item_path_abs}: {e}", exc_info=True)
 
@@ -343,8 +369,6 @@ def find_files_local_indexed(catalog_path: Path, search_bbox_4326, index_name: s
 # Main Script Logic
 # ----------------------------------------------------------------------
 def main(cli_args):
-    """Main execution function, using parsed CLI arguments."""
-
     FORMAT_MAP = {
         'GTIFF': {'driver': 'GTiff', 'ext': '.tif'},
         'AAIGRID': {'driver': 'AAIGrid', 'ext': '.asc'},
@@ -359,252 +383,230 @@ def main(cli_args):
     Config.OUTPUT_BASE_DIR = Path(cli_args.output_dir)
     Config.KEEP_TEMP_FILES = cli_args.keep_temp_files
     Config.FORCE_LOCAL_STAC = cli_args.force_local_stac
+    Config.FORCE_OSN = cli_args.force_osn
+    if cli_args.stac_catalog_path:
+        Config.LOCAL_STAC_CATALOG_PATH = Path(cli_args.stac_catalog_path)
     selected_format_key = cli_args.output_format.upper()
 
     log_file_path = Config.OUTPUT_BASE_DIR / f"processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     setup_logging(log_file_path, Config.LOG_LEVEL)
 
     logger.info("--- Script Started ---")
-    logger.info(f"Running with AOI: minlon={Config.MIN_LON}, minlat={Config.MIN_LAT}, maxlon={Config.MAX_LON}, maxlat={Config.MAX_LAT}")
+    logger.info(f"AOI: minlon={Config.MIN_LON}, minlat={Config.MIN_LAT}, maxlon={Config.MAX_LON}, maxlat={Config.MAX_LAT}")
     logger.info(f"Output directory: {Config.OUTPUT_BASE_DIR}")
-    logger.info(f"Selected Output Format: {selected_format_key}")
-    logger.info(f"Keep temporary files: {Config.KEEP_TEMP_FILES}")
-    logger.info(f"Force local STAC: {Config.FORCE_LOCAL_STAC}")
+    logger.info(f"Output format: {selected_format_key}")
+    logger.info(f"Keep temp files: {Config.KEEP_TEMP_FILES}")
+    logger.info(f"--force_local_stac: {Config.FORCE_LOCAL_STAC}  --force_osn: {Config.FORCE_OSN}")
 
-    if not Config.OUTPUT_BASE_DIR.exists():
-        logger.error(f"Output directory does not exist: {Config.OUTPUT_BASE_DIR}. Please create it or provide a valid path. Exiting.")
+    if not Config.OUTPUT_BASE_DIR.exists() or not Config.OUTPUT_BASE_DIR.is_dir():
+        logger.error(f"Output directory does not exist or is not a directory: {Config.OUTPUT_BASE_DIR}. Exiting.")
         sys.exit(1)
-    if not Config.OUTPUT_BASE_DIR.is_dir():
-        logger.error(f"Provided output path is not a directory: {Config.OUTPUT_BASE_DIR}. Exiting.")
-        sys.exit(1)
-    logger.info(f"Output directory confirmed: {Config.OUTPUT_BASE_DIR}")
 
-    projwin_ulx = Config.MIN_LON
-    projwin_uly = Config.MAX_LAT
-    projwin_lrx = Config.MAX_LON
-    projwin_lry = Config.MIN_LAT
-    logger.info(f"Using Bounding Box (EPSG:4326) for projwin: ulx={projwin_ulx}, uly={projwin_uly}, lrx={projwin_lrx}, lry={projwin_lry}")
+    projwin_ulx, projwin_uly = Config.MIN_LON, Config.MAX_LAT
+    projwin_lrx, projwin_lry = Config.MAX_LON, Config.MIN_LAT
 
-    logger.info("\n--- Attempting URL Retrieval ---")
-    url_data_list = None # This will be a list of dicts: [{'vsi': ..., 's3_https': ...}]
-    query_time = None
-    retrieval_method_used = "None"
-
-    if Config.FORCE_LOCAL_STAC:
-        logger.info("FORCE_LOCAL_STAC is True. Using Local STAC catalog directly.")
-        try:
-            url_data_list, query_time = get_geotiff_urls(
-                "LOCAL_STAC", Config.MIN_LON, Config.MIN_LAT, Config.MAX_LON, Config.MAX_LAT,
-                Config.LOCAL_STAC_CATALOG_PATH, Config.LOCAL_STAC_INDEX_NAME
-            )
-            if url_data_list:
-                logger.info(f"Successfully retrieved {len(url_data_list)} URL entries from Local STAC Catalog.")
-                retrieval_method_used = "LOCAL_STAC (Forced)"
-            else:
-                 logger.critical("Local STAC (forced) failed or returned no URLs.")
-        except Exception as e_stac:
-            logger.critical(f"Local STAC catalog search (forced) failed ({type(e_stac).__name__}: {e_stac}). Exiting.", exc_info=True)
-            sys.exit(1)
-    else:
-        try:
-            url_data_list, query_time = get_geotiff_urls(
-                "USGS_API", Config.MIN_LON, Config.MIN_LAT, Config.MAX_LON, Config.MAX_LAT,
-                Config.LOCAL_STAC_CATALOG_PATH, Config.LOCAL_STAC_INDEX_NAME
-            )
-            if url_data_list:
-                logger.info(f"Successfully retrieved {len(url_data_list)} URL entries from USGS Product API.")
-                retrieval_method_used = "USGS_API"
-            else:
-                raise Exception("USGS API failed or returned no URLs.")
-        except Exception as e_usgs:
-            logger.warning(f"USGS Product API failed ({type(e_usgs).__name__}: {e_usgs}). Falling back to Local STAC catalog.")
-            try:
-                url_data_list, query_time = get_geotiff_urls(
-                    "LOCAL_STAC", Config.MIN_LON, Config.MIN_LAT, Config.MAX_LON, Config.MAX_LAT,
-                    Config.LOCAL_STAC_CATALOG_PATH, Config.LOCAL_STAC_INDEX_NAME
-                )
-                if url_data_list:
-                    logger.info(f"Successfully retrieved {len(url_data_list)} URL entries from Local STAC Catalog.")
-                    retrieval_method_used = "LOCAL_STAC (Fallback)"
-                else:
-                     logger.critical("Local STAC (fallback) also failed or returned no URLs.")
-            except Exception as e_stac:
-                logger.critical(f"Local STAC catalog search (fallback) also failed ({type(e_stac).__name__}: {e_stac}). Exiting.", exc_info=True)
-                sys.exit(1)
+    # --- Step 1: Query local STAC (always) ---
+    logger.info("\n--- Querying Local STAC Catalog ---")
+    query_start_time = datetime.now()
+    url_data_list = find_files_local_indexed(
+        Config.LOCAL_STAC_CATALOG_PATH, Config.BBOX_4326, Config.LOCAL_STAC_INDEX_NAME
+    )
+    query_time = datetime.now() - query_start_time
 
     if not url_data_list:
-        logger.critical("Failed to retrieve any GeoTIFF URLs using chosen method(s). Exiting.")
+        logger.critical("Local STAC search returned no URLs. Exiting.")
+        sys.exit(1)
+    logger.info(f"Local STAC found {len(url_data_list)} URL(s). Query time: {query_time}")
+
+    # --- Step 2: Determine data source ---
+    logger.info("\n--- Determining Data Source ---")
+    use_osn = False
+    health_check_time = None
+    source_label = ""
+
+    if Config.FORCE_LOCAL_STAC:
+        source_label = "USGS S3 (--force_local_stac, health check skipped)"
+    elif Config.FORCE_OSN:
+        use_osn = True
+        source_label = "OSN mirror (--force_osn, health check skipped)"
+    else:
+        sample_urls = [e['s3_https'] for e in url_data_list if e.get('s3_https')][:Config.USGS_HEALTH_CHECK_SAMPLE_COUNT]
+        health_check_start = datetime.now()
+        usgs_ok = _check_usgs_accessible(sample_urls)
+        health_check_time = datetime.now() - health_check_start
+        if usgs_ok:
+            source_label = "USGS S3 (health check passed)"
+        else:
+            use_osn = True
+            source_label = "OSN mirror (USGS health check failed, using OSN failover)"
+
+    logger.info(f"Data source: {source_label}")
+
+    gdal_env = None
+    if use_osn:
+        try:
+            gdal_env = _get_osn_gdal_env()
+        except Exception as e:
+            logger.critical(f"Failed to load OSN credentials: {e}. Exiting.")
+            sys.exit(1)
+
+    # --- Step 3: Build VSI and USGS URL lists ---
+    vsi_urls_for_vrt = []
+    s3_https_urls_for_log = []
+    osn_fallback_count = 0
+
+    for entry in url_data_list:
+        if use_osn:
+            if entry.get('osn_vsi'):
+                vsi_urls_for_vrt.append(entry['osn_vsi'])
+            elif entry.get('vsi'):
+                vsi_urls_for_vrt.append(entry['vsi'])
+                osn_fallback_count += 1
+                logger.warning(f"No OSN asset for tile, falling back to USGS: {entry.get('s3_https', 'unknown')}")
+        else:
+            if entry.get('vsi'):
+                vsi_urls_for_vrt.append(entry['vsi'])
+
+        s3_url = entry.get('s3_https')
+        if s3_url:
+            s3_https_urls_for_log.append(s3_url)
+        elif entry.get('vsi'):
+            s3_https_urls_for_log.append(Path(entry['vsi']).name)
+            logger.warning(f"No USGS S3 URL for tile, writing bare filename to URL list.")
+
+    if use_osn and osn_fallback_count > 0:
+        logger.warning(f"{osn_fallback_count} tile(s) had no OSN asset and fell back to USGS VSI paths.")
+
+    if not vsi_urls_for_vrt:
+        logger.critical("No valid VSI URLs to process for VRT. Exiting.")
         sys.exit(1)
 
+    # --- Step 4: GDAL Processing ---
     logger.info("\n--- Processing GDAL Operations ---")
 
     format_info = FORMAT_MAP[selected_format_key]
     gdal_driver_name = format_info['driver']
     output_basename = "output_USGS1m"
-    primary_output_filename = output_basename + format_info['ext']
-
+    primary_output_raster_file = Config.OUTPUT_BASE_DIR / (output_basename + format_info['ext'])
     out_vsi_url_list_file = Config.OUTPUT_BASE_DIR / Config.AOI_VSI_URL_LIST_FILE_NAME
     out_s3_https_url_list_file = Config.OUTPUT_BASE_DIR / Config.OUTPUT_S3_URL_LIST_FILE_NAME
     vrt_file = Config.OUTPUT_BASE_DIR / Config.TEMP_VRT_FILE_NAME
-    primary_output_raster_file = Config.OUTPUT_BASE_DIR / primary_output_filename
-
     vrt_build_time = None
     translate_time = None
 
     try:
-        vsi_urls_for_vrt = [entry['vsi'] for entry in url_data_list if entry['vsi']]
-        s3_https_urls_for_log = [entry['s3_https'] for entry in url_data_list if entry['s3_https']]
-
-        if not vsi_urls_for_vrt:
-            logger.critical("No valid VSI URLs to process for VRT. Exiting.")
-            sys.exit(1)
-
         with open(out_vsi_url_list_file, 'w') as f_out:
             for url in vsi_urls_for_vrt:
                 f_out.write(url + '\n')
-        logger.info(f"Successfully wrote {len(vsi_urls_for_vrt)} VSI URLs to {out_vsi_url_list_file}")
+        logger.info(f"Wrote {len(vsi_urls_for_vrt)} VSI URLs to {out_vsi_url_list_file}")
 
-        if s3_https_urls_for_log:
-            with open(out_s3_https_url_list_file, 'w') as f_out_s3:
-                for url in s3_https_urls_for_log:
-                    f_out_s3.write(url + '\n')
-            logger.info(f"Successfully wrote {len(s3_https_urls_for_log)} original S3 HTTPS URLs to {out_s3_https_url_list_file}")
-        else:
-            logger.info(f"No S3 HTTPS URLs to write to {out_s3_https_url_list_file} (possibly all local files or non-S3 sources).")
-
+        source_comment = "# Source: OSN mirror (USGS URLs shown)\n" if use_osn else "# Source: USGS S3 (direct)\n"
+        with open(out_s3_https_url_list_file, 'w') as f_out_s3:
+            f_out_s3.write(source_comment)
+            for url in s3_https_urls_for_log:
+                f_out_s3.write(url + '\n')
+        logger.info(f"Wrote {len(s3_https_urls_for_log)} USGS S3 URLs to {out_s3_https_url_list_file}")
 
         vrt_start_time = datetime.now()
-        cmd_gdalbuildvrt = [
-            str(Config.GDAL_BUILDVRT_BIN), str(vrt_file),
-            "-input_file_list", str(out_vsi_url_list_file)
-        ]
-        run_subprocess_command(cmd_gdalbuildvrt, suppress_403_warnings=True, log_prefix="GDALBUILDVRT")
+        run_subprocess_command(
+            [str(Config.GDAL_BUILDVRT_BIN), str(vrt_file), "-input_file_list", str(out_vsi_url_list_file)],
+            suppress_403_warnings=True, log_prefix="GDALBUILDVRT", env=gdal_env
+        )
         vrt_build_time = datetime.now() - vrt_start_time
 
         translate_start_time = datetime.now()
-        projwin_args = [str(val) for val in [projwin_ulx, projwin_uly, projwin_lrx, projwin_lry]]
-
-        cmd_gdal_translate_list = [
-            str(Config.GDAL_TRANSLATE_BIN),
-            "-of", gdal_driver_name,
-            "-projwin"] + projwin_args + [
-            "-projwin_srs", "EPSG:4326",
-            str(vrt_file)
+        projwin_args = [str(v) for v in [projwin_ulx, projwin_uly, projwin_lrx, projwin_lry]]
+        cmd_translate = [
+            str(Config.GDAL_TRANSLATE_BIN), "-of", gdal_driver_name,
+            "-projwin"] + projwin_args + ["-projwin_srs", "EPSG:4326", str(vrt_file)
         ]
         if selected_format_key == 'GTIFF':
-             cmd_gdal_translate_list.extend([
-                "-co", "COMPRESS=deflate", "-co", "TILED=YES",
-                "-co", "blockxsize=512", "-co", "blockysize=512"
-            ])
-        cmd_gdal_translate_list.append(str(primary_output_raster_file))
-
-        run_subprocess_command(cmd_gdal_translate_list, suppress_403_warnings=False, log_prefix="GDAL_TRANSLATE")
+            cmd_translate.extend(["-co", "COMPRESS=deflate", "-co", "TILED=YES",
+                                   "-co", "blockxsize=512", "-co", "blockysize=512"])
+        cmd_translate.append(str(primary_output_raster_file))
+        run_subprocess_command(cmd_translate, suppress_403_warnings=False, log_prefix="GDAL_TRANSLATE", env=gdal_env)
         translate_time = datetime.now() - translate_start_time
-        logger.info(f"Successfully created primary output file: {primary_output_raster_file}")
+        logger.info(f"Successfully created: {primary_output_raster_file}")
 
-        # --- New: Archive all generated files and then clean them up ---
         logger.info("\n--- Archiving results and cleaning up ---")
-
-        # Discover all files starting with "output."        
         gdal_output_files = list(Config.OUTPUT_BASE_DIR.glob(f"{output_basename}.*"))
-        files_to_archive_and_delete = gdal_output_files.copy()
-
-        # Add the URL list to the list of files to archive and delete        
-        if out_s3_https_url_list_file.exists():
-            files_to_archive_and_delete.append(out_s3_https_url_list_file)
-        else:
-            logger.warning(f"URL list file not found, will not be included in tarball: {out_s3_https_url_list_file}")
-
         if not gdal_output_files:
-            logger.error("gdal_translate seems to have failed as no 'output.*' files were found. Halting before archiving.")
+            logger.error("No 'output.*' files found after gdal_translate. Halting before archiving.")
             sys.exit(1)
+        files_to_archive = gdal_output_files.copy()
+        if out_s3_https_url_list_file.exists():
+            files_to_archive.append(out_s3_https_url_list_file)
 
-        logger.info(f"Found {len(files_to_archive_and_delete)} file(s) to archive: {[f.name for f in files_to_archive_and_delete]}")
-
+        logger.info(f"Archiving {len(files_to_archive)} file(s): {[f.name for f in files_to_archive]}")
         tarball_path = Config.OUTPUT_BASE_DIR / Config.OUTPUT_TARBALL_NAME
         try:
-            # Create the tarball
             with tarfile.open(tarball_path, "w:gz") as tar:
-                for file_path in files_to_archive_and_delete:
-                    tar.add(file_path, arcname=file_path.name)
-            logger.info(f"Successfully created output tarball: {tarball_path}")
-
-            # Cleanup original files ONLY after successful tar creation            
-            logger.info("Cleaning up original archived files...")
-            for file_path in files_to_archive_and_delete:
+                for fp in files_to_archive:
+                    tar.add(fp, arcname=fp.name)
+            logger.info(f"Created tarball: {tarball_path}")
+            for fp in files_to_archive:
                 try:
-                    if file_path.exists():
-                        file_path.unlink()
-                        logger.info(f"Removed: {file_path.name}")
+                    if fp.exists():
+                        fp.unlink()
                 except OSError as e:
-                    logger.warning(f"Failed to remove file '{file_path.name}': {e}")
-
-        except tarfile.TarError as e:
-            logger.error(f"Failed to create tarball. Original files will be kept. Error: {e}", exc_info=True)
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during archiving/cleanup: {e}", exc_info=True)
-
+                    logger.warning(f"Failed to remove '{fp.name}': {e}")
+        except (tarfile.TarError, Exception) as e:
+            logger.error(f"Archiving failed, original files kept: {e}", exc_info=True)
 
     except subprocess.CalledProcessError:
         logger.critical("A GDAL command failed. Check logs. Exiting.")
         sys.exit(1)
     except IOError as e:
-        logger.critical(f"File I/O error during GDAL processing: {e}. Exiting.", exc_info=True)
+        logger.critical(f"File I/O error: {e}. Exiting.", exc_info=True)
     except Exception as e:
-        logger.critical(f"Unexpected error during GDAL processing: {type(e).__name__}: {e}. Exiting.", exc_info=True)
+        logger.critical(f"Unexpected error: {type(e).__name__}: {e}. Exiting.", exc_info=True)
         sys.exit(1)
     finally:
         if not Config.KEEP_TEMP_FILES:
-            logger.info("\n--- Performing Cleanup of Temporary Files ---")
             try:
-                if out_vsi_url_list_file.exists():
-                    out_vsi_url_list_file.unlink()
-                    logger.info(f"Removed temporary VSI URL list file: {out_vsi_url_list_file}")
-                if vrt_file.exists():
-                    vrt_file.unlink()
-                    logger.info(f"Removed temporary VRT file: {vrt_file}")
+                for tmp in [out_vsi_url_list_file, vrt_file]:
+                    if tmp.exists():
+                        tmp.unlink()
+                        logger.info(f"Removed temp file: {tmp}")
             except OSError as e:
-                logger.warning(f"Failed to remove one or more temporary files: {e}", exc_info=True)
+                logger.warning(f"Failed to remove temp files: {e}", exc_info=True)
         else:
-            logger.info(f"\n--- Skipping Cleanup of Temporary Files ---")
-            logger.info(f"Temporary VSI URL list file (kept): {out_vsi_url_list_file}")
-            logger.info(f"Temporary VRT file (kept): {vrt_file}")
-
+            logger.info(f"Temp files kept: {out_vsi_url_list_file}, {vrt_file}")
 
     logger.info("\n--- Final Execution Times ---")
-    if query_time:  logger.info(f"Time to query URLs ({retrieval_method_used}): {query_time}")
-    if vrt_build_time: logger.info(f"Time to build VRT:             {vrt_build_time}")
-    if translate_time: logger.info(f"Time to run GDAL translate:    {translate_time}")
-
+    logger.info(f"STAC query:          {query_time}")
+    if health_check_time:
+        logger.info(f"USGS health check:   {health_check_time}")
+    if vrt_build_time:
+        logger.info(f"VRT build:           {vrt_build_time}")
+    if translate_time:
+        logger.info(f"GDAL translate:      {translate_time}")
+    logger.info(f"Data source:         {source_label}")
     logger.info("--- Script Finished Successfully ---")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Retrieve USGS 1m DEM data for a given AOI, using USGS API with a local STAC fallback.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="If no command-line arguments are specified for AOI or output directory, "
-               "the script will use the default values defined in its configuration."
+        description="Retrieve USGS 1m DEM data for a given AOI using local STAC with USGS/OSN source selection.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # --- AOI Arguments ---
-    parser.add_argument("--minlon", type=float, default=Config.DEFAULT_MIN_LON,
-                        help="Minimum longitude of AOI (EPSG:4326).")
-    parser.add_argument("--minlat", type=float, default=Config.DEFAULT_MIN_LAT,
-                        help="Minimum latitude of AOI (EPSG:4326).")
-    parser.add_argument("--maxlon", type=float, default=Config.DEFAULT_MAX_LON,
-                        help="Maximum longitude of AOI (EPSG:4326).")
-    parser.add_argument("--maxlat", type=float, default=Config.DEFAULT_MAX_LAT,
-                        help="Maximum latitude of AOI (EPSG:4326).")
-
-    # --- Configuration Arguments ---
+    parser.add_argument("--minlon", type=float, default=Config.DEFAULT_MIN_LON, help="Min longitude (EPSG:4326).")
+    parser.add_argument("--minlat", type=float, default=Config.DEFAULT_MIN_LAT, help="Min latitude (EPSG:4326).")
+    parser.add_argument("--maxlon", type=float, default=Config.DEFAULT_MAX_LON, help="Max longitude (EPSG:4326).")
+    parser.add_argument("--maxlat", type=float, default=Config.DEFAULT_MAX_LAT, help="Max latitude (EPSG:4326).")
     parser.add_argument("--output_dir", type=str, default=str(Config.DEFAULT_OUTPUT_BASE_DIR),
-                        help="Base directory for all outputs. This directory MUST exist.")
-    parser.add_argument("--output_format", type=str.upper, default='GTIFF',
-                        choices=['GTIFF', 'AAIGRID', 'HFA'],
-                        help="The desired output format for the final raster file. Defaults to 'GTIFF'.")
+                        help="Output directory (must exist).")
+    parser.add_argument("--output_format", type=str.upper, default='GTIFF', choices=['GTIFF', 'AAIGRID', 'HFA'])
     parser.add_argument("--keep_temp_files", action='store_true',
-                        help="If specified, temporary files (VSI URL list, VRT) will not be deleted (default: False).")
-    parser.add_argument("--force_local_stac", action='store_true',
-                        help="If specified, bypass the USGS Product API and use only the local STAC catalog (default: False).")
+                        help="Keep temporary VSI URL list and VRT files.")
+    parser.add_argument("--stac_catalog_path", type=str, default=None,
+                        help="Override the local STAC catalog path.")
+
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument("--force_local_stac", action='store_true',
+                              help="Skip health check and use USGS VSI paths from local STAC.")
+    source_group.add_argument("--force_osn", action='store_true',
+                              help="Skip health check and use OSN VSI paths from local STAC.")
 
     cli_args = parser.parse_args()
     main(cli_args)
