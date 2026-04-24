@@ -108,7 +108,6 @@ Add the OSN asset (`elevation-geotiff-osn`) alongside the existing USGS asset
 ### 1d. Add `--add-osn-assets` migration mode
 A one-time migration (with dry-run and checkpointing support) that:
 - Optionally runs `--dry-run` to preview changes without writing
-- Checks OSN connectivity before starting
 - Loads the existing catalog
 - Iterates every item, skipping projects already in the checkpoint file
 - Adds the OSN asset where missing, logs a warning and continues for unmappable URLs

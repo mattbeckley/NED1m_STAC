@@ -6,6 +6,12 @@ validator_output.txt
 MAB_README.txt
 cronoutput.txt
 
+# OSN credentials — never commit these
+osn_credentials.ini
+
+# OSN migration checkpoint file
+osn_migration_progress.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

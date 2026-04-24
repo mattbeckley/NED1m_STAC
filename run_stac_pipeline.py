@@ -1,78 +1,105 @@
+import argparse
+from collections import defaultdict
 import boto3
 import xml.etree.ElementTree as ET
 import json
 import pystac
-from pystac.extensions.eo import EOExtension # For common metadata if applicable
-from shapely.geometry import Polygon, box # box for creating geometry from bbox
-from shapely.ops import unary_union # For combining bboxes
+from pystac.extensions.eo import EOExtension
+from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
 import os
+import requests
 from datetime import datetime, timezone, timedelta
-from pathlib import Path # For path operations
+from pathlib import Path
 import logging
-import sys # For sys.argv and logging
-from rtree import index as rtree_index # For R-tree indexing
-import pickle # For saving the item map
+import sys
+from rtree import index as rtree_index
+import pickle
 
 # -----------------------------------------------------------------------------
-# STAC Catalog Builder, Updater, and Indexer for USGS TNM 1m Elevation Data
+# STAC Catalog Builder, Updater, Indexer, and OSN Migrator
+# for USGS TNM 1m Elevation Data
 # -----------------------------------------------------------------------------
 #
 # Purpose:
-# This script creates, maintains, and spatially indexes a local STAC
-# (SpatioTemporal Asset Catalog) from the XML metadata files associated
-# with the USGS The National Map (TNM) 1-meter Digital Elevation Model (DEM)
-# products. These products are hosted on an AWS S3 bucket (prd-tnm).
+# Builds and maintains a local STAC (SpatioTemporal Asset Catalog) from the
+# XML metadata files for USGS The National Map (TNM) 1-meter DEM products
+# hosted on the prd-tnm S3 bucket. Each STAC item stores two asset URLs:
+#   - elevation-geotiff     : public USGS S3 URL
+#   - elevation-geotiff-osn : OSN mirror URL (used as failover by NED1m_Query.py)
 #
-# How it Works:
-# 1. S3 Interaction: Uses boto3 to list project folders and XML metadata files
-#    within the specified S3 bucket and prefix.
-# 2. XML Parsing: For each relevant XML file, it parses metadata such as
-#    bounding box, start/end dates, and the path to the GeoTIFF asset.
-# 3. STAC Object Creation: Uses the PySTAC library to create:
-#    - STAC Items for each GeoTIFF, including its geometry, bbox, datetime,
-#      and an asset link pointing to the public S3 URL of the GeoTIFF.
-#    - A STAC Collection to group these items.
-#    - A root STAC Catalog that contains the collection.
-# 4. Create Mode: If no existing local catalog is found, it processes all
-#    project folders found on S3 and builds a new STAC catalog from scratch.
-# 5. Update Mode: If an existing local catalog is detected, the script loads it,
-#    identifies which S3 project folders have not yet been processed, and only
-#    processes these new folders.
-# 6. Extent Updates: After adding new items, the spatial and temporal extents
-#    of the STAC Collection are recalculated.
-# 7. Portability: Saves catalog as `SELF_CONTAINED` with relative HREFs for
-#    internal links. Asset HREFs are absolute S3 URLs.
-# 8. Conditional Indexing: If the catalog was newly created or updated with new
-#    items, the script proceeds to build a spatial R-tree index. This index
-#    allows for very fast bounding box queries. If no updates were made, this
-#    step is skipped.
-# 9. Logging: Outputs to console and a daily log file.
+# The OSN mirror (usgs.osn.mghpcc.org) is a full copy of the USGS prd-tnm
+# bucket maintained via rclone sync. It serves as a reliable failover when
+# USGS S3 is unavailable. OSN requires S3-compatible credentials and is not
+# publicly accessible.
 #
-# Key Features & Things to Be Aware Of:
-# - Incremental Updates: Reduces processing time by only adding new data.
-# - Conditional Indexing: The R-tree index is only rebuilt if the catalog was
-#   actually modified, saving significant time on runs where no new data is found.
-# - Configurable Processing:
-#   - `MAX_PROJECT_FOLDERS_TO_PROCESS`: Limits total S3 folders for quick tests.
-#   - `PROJECTS_TO_PROCESS`: Allows specifying a list of exact project folder
-#     names to process, useful for debugging or focused cataloging.
-# - URL Handling: Converts various `networkr` path formats (HTTP, S3, FTP, Windows)
-#   from XMLs into consistent HTTPS S3 URLs for assets.
-# - AWS Credentials: Requires configured `boto3` access.
+# Operating Modes:
 #
-# Prerequisites/Libraries: boto3, pystac, shapely, rtree
+#   Default (no flags):
+#     Automatically detects whether an existing catalog is present and runs
+#     in create mode (no catalog found) or update mode (catalog exists).
+#     - Create mode: processes all project folders on S3 from scratch.
+#     - Update mode: identifies project folders not yet in the catalog and
+#       adds only those, then rebuilds the R-tree index if any changes were made.
+#     Both modes add elevation-geotiff and elevation-geotiff-osn assets to
+#     every new STAC item. Run weekly via cron to keep the catalog current.
 #
-# Last Substantial Modification: [Gemini - 2025-06-06]
+#   --add-osn-assets:
+#     One-time migration mode. Adds the elevation-geotiff-osn asset to all
+#     existing catalog items that were created before OSN support was added.
+#     Supports --dry-run to preview changes without writing, and checkpointing
+#     so an interrupted run can be resumed from where it left off.
+#     After all items are updated, saves the catalog and rebuilds the R-tree.
 #
-# MAB Notes:
-# - Note that if a project exists but is empty (i.e. no xml files), it
-# will not get ingested.  So, next time if the code is run at a later
-# date, and the project now has xmls, it will get ingested.  In this
-# way, we won't be missing projects that get added in separate steps.
+# Command-Line Arguments:
+#   (no flags)             Run the normal weekly create/update pipeline.
 #
-#- STAC creation/update code was merged with r-tree code to aid in
-#  calling this code with a cronjob.  Especially, if there are not
-#  updates, I don't want to build the r-tree if is not necessary.
+#   --add-osn-assets       Migration mode: add OSN mirror assets to existing
+#                          catalog items that are missing them.
+#                          Default: False
+#
+#   --dry-run              Used with --add-osn-assets. Logs what would be
+#                          changed without writing anything to disk.
+#                          Default: False
+#
+#   --stac_catalog_path PATH
+#                          Used with --add-osn-assets. Override the catalog
+#                          directory (derived from the given catalog.json path).
+#                          Useful for running the migration against a test
+#                          catalog before touching production.
+#                          Default: uses Config.OUTPUT_DIRECTORY_BASE
+#
+# Config Variables (edit in the Config class to change behavior):
+#   OUTPUT_DIRECTORY_BASE  Root directory for the catalog and index files.
+#                          Default: /data/matt/NED1m_STAC/
+#   PROJECTS_TO_PROCESS    List of specific project folder names to process,
+#                          or None to process all. Useful for small-batch tests.
+#                          Default: None (process all)
+#   MAX_PROJECT_FOLDERS_TO_PROCESS
+#                          Integer cap on the number of folders processed, or
+#                          None for no limit. Applied after PROJECTS_TO_PROCESS
+#                          filtering. Useful for quick smoke tests.
+#                          Default: None (no limit)
+#   OSN_ENDPOINT           Base URL of the OSN S3-compatible endpoint.
+#                          Default: https://usgs.osn.mghpcc.org
+#   OSN_BUCKET_NAME        OSN bucket containing the USGS mirror.
+#                          Default: ot-usgs-osn
+#   LOG_LEVEL              Logging verbosity (DEBUG, INFO, WARNING, ERROR).
+#                          Default: INFO
+#
+# Key Behaviors:
+# - Empty project folders (no XML files) are skipped and will be picked up on
+#   a future run once XML files are added.
+# - The R-tree index is only rebuilt when the catalog is actually modified,
+#   avoiding unnecessary work on no-change weekly runs.
+# - URL normalization handles multiple networkr path formats found in USGS XML
+#   metadata: HTTP/HTTPS, S3 URIs, FTP (rockyftp/rockyweb), and Windows UNC paths.
+# - The --add-osn-assets migration writes a checkpoint file
+#   (osn_migration_progress.txt) after each project so a failed run can be
+#   resumed without restarting from scratch.
+#
+# Prerequisites: boto3, pystac, shapely, rtree, requests
+# Last Substantial Modification: 2026-04-24
 # -----------------------------------------------------------------------------
 
 # --- Configuration ---
@@ -100,6 +127,7 @@ class Config:
     OSN_BUCKET_NAME = "ot-usgs-osn"
     OSN_BASE_URL = f"{OSN_ENDPOINT}/{OSN_BUCKET_NAME}/"
     USGS_S3_PREFIX_IN_OSN = "StagedProducts/"  # this prefix is stripped when mapping to OSN
+    ROCKYWEB_PREFIX = "https://rockyweb.usgs.gov/vdelivery/Datasets/Staged/"
 
     #Log settings can be set to: DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOG_LEVEL = logging.INFO
@@ -242,16 +270,21 @@ def _parse_xml_to_stac_item_properties(xml_content, xml_key, s3_project_folder_p
 
 def _usgs_url_to_osn_url(usgs_https_url):
     """
-    Converts a USGS prd-tnm S3 HTTPS URL to its OSN mirror equivalent.
-    The rclone sync strips the StagedProducts/ prefix:
+    Converts a USGS HTTPS URL to its OSN mirror equivalent.
+    Handles both prd-tnm S3 and rockyweb.usgs.gov URLs — both map to the
+    same OSN path after stripping their respective prefixes up to 'Staged/':
       https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/...
+      https://rockyweb.usgs.gov/vdelivery/Datasets/Staged/Elevation/1m/...
       → https://usgs.osn.mghpcc.org/ot-usgs-osn/Elevation/1m/...
     Returns None if the URL cannot be mapped.
     """
-    usgs_prefix = f"{Config.S3_PUBLIC_BASE_URL}{Config.USGS_S3_PREFIX_IN_OSN}"
-    if usgs_https_url and usgs_https_url.startswith(usgs_prefix):
-        path_after_staged = usgs_https_url[len(usgs_prefix):]
-        return f"{Config.OSN_BASE_URL}{path_after_staged}"
+    if not usgs_https_url:
+        return None
+    usgs_s3_prefix = f"{Config.S3_PUBLIC_BASE_URL}{Config.USGS_S3_PREFIX_IN_OSN}"
+    if usgs_https_url.startswith(usgs_s3_prefix):
+        return f"{Config.OSN_BASE_URL}{usgs_https_url[len(usgs_s3_prefix):]}"
+    if usgs_https_url.startswith(Config.ROCKYWEB_PREFIX):
+        return f"{Config.OSN_BASE_URL}{usgs_https_url[len(Config.ROCKYWEB_PREFIX):]}"
     return None
 
 def _create_stac_item(item_id, bbox, geometry_geojson, item_datetime_obj, properties, asset_href):
@@ -263,6 +296,109 @@ def _create_stac_item(item_id, bbox, geometry_geojson, item_datetime_obj, proper
     else:
         logger.debug(f"Could not derive OSN URL for item {item_id}, asset href: {asset_href}")
     return item
+
+def add_osn_assets_to_catalog(output_dir_path, dry_run=False):
+    """
+    One-time migration: adds elevation-geotiff-osn assets to existing catalog items
+    that have a mappable USGS URL. Supports dry-run and checkpointing so a failed
+    mid-run can be resumed without restarting from scratch.
+    """
+    output_dir = Path(output_dir_path)
+    catalog_file = output_dir / "catalog.json"
+    checkpoint_file = output_dir / "osn_migration_progress.txt"
+
+    if not catalog_file.exists():
+        logger.error(f"Catalog not found: {catalog_file}")
+        return False
+
+    completed_projects = set()
+    if checkpoint_file.exists():
+        completed_projects = {l.strip() for l in checkpoint_file.read_text().splitlines() if l.strip()}
+        logger.info(f"Checkpoint: {len(completed_projects)} project(s) already processed, will skip.")
+
+    logger.info(f"Loading catalog from {catalog_file}...")
+    catalog = pystac.read_file(str(catalog_file))
+    collection = catalog.get_child(Config.COLLECTION_ID, recursive=True)
+    if not collection:
+        logger.error(f"Collection '{Config.COLLECTION_ID}' not found in catalog.")
+        return False
+
+    logger.info("Grouping items by project folder...")
+    projects = defaultdict(list)
+    for item in collection.get_all_items():
+        projects[item.properties.get('s3_project_folder', '')].append(item)
+
+    total_projects = len(projects)
+    skippable = len(completed_projects & projects.keys())
+    logger.info(f"Catalog has {total_projects} project(s). {skippable} already checkpointed, "
+                f"{total_projects - skippable} to process.")
+
+    total_added = 0
+    total_already_have_osn = 0
+    total_unmappable = 0
+
+    for project_folder, items in sorted(projects.items()):
+        if project_folder in completed_projects:
+            continue
+
+        project_added = 0
+        project_unmappable = 0
+
+        for item in items:
+            if 'elevation-geotiff-osn' in item.assets:
+                total_already_have_osn += 1
+                continue
+            usgs_asset = item.assets.get('elevation-geotiff')
+            if not usgs_asset:
+                logger.warning(f"Item {item.id}: no elevation-geotiff asset, skipping.")
+                project_unmappable += 1
+                continue
+            osn_url = _usgs_url_to_osn_url(usgs_asset.href)
+            if osn_url:
+                if not dry_run:
+                    item.add_asset("elevation-geotiff-osn", pystac.Asset(
+                        href=osn_url,
+                        media_type=pystac.MediaType.COG,
+                        title="1m Elevation GeoTIFF (OSN mirror)",
+                        roles=["data", "elevation"]
+                    ))
+                project_added += 1
+            else:
+                logger.warning(f"Item {item.id}: cannot map to OSN URL ({usgs_asset.href}), skipping.")
+                project_unmappable += 1
+
+        total_added += project_added
+        total_unmappable += project_unmappable
+        prefix = "[DRY RUN] " if dry_run else ""
+        verb = "would add" if dry_run else "added"
+        logger.info(f"{prefix}{project_folder}: {project_added} OSN asset(s) {verb}, "
+                    f"{project_unmappable} unmappable.")
+
+        if not dry_run:
+            with open(checkpoint_file, 'a') as f:
+                f.write(project_folder + '\n')
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    verb = "would be added" if dry_run else "added"
+    logger.info(f"{prefix}Migration summary: {total_added} OSN asset(s) {verb}, "
+                f"{total_already_have_osn} item(s) already had OSN asset, "
+                f"{total_unmappable} item(s) unmappable (see warnings above).")
+
+    if not dry_run and total_added > 0:
+        logger.info("Saving updated catalog...")
+        catalog.normalize_hrefs(str(output_dir))
+        catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED, dest_href=str(output_dir))
+        logger.info("Rebuilding R-tree index...")
+        index_stac_collection(
+            catalog_path_str=str(catalog_file),
+            collection_id=Config.COLLECTION_ID_TO_INDEX,
+            index_basename=Config.INDEX_BASENAME
+        )
+    elif not dry_run:
+        logger.info("No items needed updating.")
+
+    return True
+
 
 def _process_s3_project_folder(s3_client, s3_project_folder_prefix_str):
     items_in_folder = []
@@ -379,6 +515,14 @@ def create_or_update_stac_catalog(output_dir_path, s3_bucket_name, s3_prefix_bas
         folders_to_process = s3_project_folders_on_s3_all
         logger.info(f"Create mode: Will process {len(folders_to_process)} project folders.")
 
+    if Config.PROJECTS_TO_PROCESS is not None:
+        folders_to_process = [f for f in folders_to_process if Path(f.rstrip('/')).name in Config.PROJECTS_TO_PROCESS]
+        logger.info(f"Filtered to {len(folders_to_process)} project folder(s) via PROJECTS_TO_PROCESS.")
+
+    if Config.MAX_PROJECT_FOLDERS_TO_PROCESS is not None:
+        folders_to_process = folders_to_process[:Config.MAX_PROJECT_FOLDERS_TO_PROCESS]
+        logger.info(f"Capped to {len(folders_to_process)} folder(s) via MAX_PROJECT_FOLDERS_TO_PROCESS.")
+
     if folders_to_process:
         for s3_project_folder_prefix in folders_to_process:
             items_from_folder = _process_s3_project_folder(s3, s3_project_folder_prefix)
@@ -475,35 +619,54 @@ def index_stac_collection(catalog_path_str, collection_id, index_basename):
 # --- Main Execution ---
 # =============================================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="STAC Catalog Builder, Updater, Indexer, and OSN Migrator")
+    parser.add_argument("--add-osn-assets", action="store_true",
+                        help="Migration mode: add elevation-geotiff-osn assets to existing catalog items.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview changes without writing (only applies to --add-osn-assets).")
+    parser.add_argument("--stac_catalog_path", type=str, default=None,
+                        help="Override the catalog path for --add-osn-assets (default: uses Config.OUTPUT_DIRECTORY_BASE).")
+    cli_args = parser.parse_args()
+
     script_start_time = datetime.now()
-    logger.info("===== Starting STAC Update and Indexing Pipeline =====")
 
-    # Determine if we are in "update" or "create" mode
-    mode = "create"
-    if Config.CATALOG_PATH.exists() and (Config.OUTPUT_DIRECTORY_BASE / Config.COLLECTION_ID / "collection.json").exists():
-        logger.info("Existing catalog found. Automatically running in 'update' mode.")
-        mode = "update"
+    if cli_args.add_osn_assets:
+        catalog_dir = Path(cli_args.stac_catalog_path).parent if cli_args.stac_catalog_path else Config.OUTPUT_DIRECTORY_BASE
+        logger.info("===== Starting OSN Asset Migration =====")
+        if cli_args.dry_run:
+            logger.info("DRY RUN mode: no changes will be written.")
+        success = add_osn_assets_to_catalog(catalog_dir, dry_run=cli_args.dry_run)
+        if not success:
+            sys.exit(1)
+        logger.info(f"Total execution time: {datetime.now() - script_start_time}")
+        logger.info("===== OSN Asset Migration Finished =====")
     else:
-        logger.info("No existing catalog found. Automatically running in 'create' mode.")
+        logger.info("===== Starting STAC Update and Indexing Pipeline =====")
 
-    # --- Step 1: Create or Update the STAC Catalog ---
-    updates_were_made = create_or_update_stac_catalog(
-        output_dir_path=Config.OUTPUT_DIRECTORY_BASE,
-        s3_bucket_name=Config.BUCKET_NAME,
-        s3_prefix_base=Config.S3_PREFIX,
-        update_mode=(mode == "update")
-    )
+        mode = "create"
+        if Config.CATALOG_PATH.exists() and (Config.OUTPUT_DIRECTORY_BASE / Config.COLLECTION_ID / "collection.json").exists():
+            logger.info("Existing catalog found. Automatically running in 'update' mode.")
+            mode = "update"
+        else:
+            logger.info("No existing catalog found. Automatically running in 'create' mode.")
 
-    # --- Step 2: Conditionally Create the R-tree Index ---
-    if updates_were_made:
-        index_stac_collection(
-            catalog_path_str=str(Config.CATALOG_PATH),
-            collection_id=Config.COLLECTION_ID_TO_INDEX,
-            index_basename=Config.INDEX_BASENAME
+        updates_were_made = create_or_update_stac_catalog(
+            output_dir_path=Config.OUTPUT_DIRECTORY_BASE,
+            s3_bucket_name=Config.BUCKET_NAME,
+            s3_prefix_base=Config.S3_PREFIX,
+            update_mode=(mode == "update")
         )
-    else:
-        logger.info("Catalog was already up-to-date. Indexing is not required.")
 
-    total_script_duration = datetime.now() - script_start_time
-    logger.info(f"Total pipeline execution time: {total_script_duration}")
-    logger.info("===== STAC Pipeline Finished =====")
+        if updates_were_made:
+            index_stac_collection(
+                catalog_path_str=str(Config.CATALOG_PATH),
+                collection_id=Config.COLLECTION_ID_TO_INDEX,
+                index_basename=Config.INDEX_BASENAME
+            )
+        else:
+            logger.info("Catalog was already up-to-date. Indexing is not required.")
+
+        total_script_duration = datetime.now() - script_start_time
+        logger.info(f"Total pipeline execution time: {total_script_duration}")
+        logger.info("===== STAC Pipeline Finished =====")
+
