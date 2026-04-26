@@ -190,14 +190,6 @@ so there is an audit trail without exposing OSN internals.
 
 ---
 
-## Phase 3 — Apply Same Changes to `RasterNED1mService.py`
-
-This file appears to be a production variant of `NED1m_Query.py`. Once Phase 2
-is complete and tested, apply the same changes here. Read the full file before
-making any changes.
-
----
-
 ## Sequencing and Risks
 
 | Step | Risk | Mitigation |

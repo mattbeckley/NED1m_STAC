@@ -75,20 +75,6 @@ python test_NED1m_Query.py 1 3 5    # run specific tests by number
 python test_NED1m_Query.py --list   # list all tests without running
 ```
 
-**`RasterNED1mService.py`**
-Production version of the query code deployed as an OpenTopography service.
-Source: https://github.com/OpenTopography/Algorithms/blob/main/RasterNED1mService.py
-(last synced 2026-02-19). Note: differs slightly from `NED1m_Query.py` in paths
-and error logging conventions. Phase 3 of the OSN redesign will apply the same
-USGS/OSN failover changes made to `NED1m_Query.py` to this file.
-
-**`NED1m_STAC_URLExtractor.py`**
-Utility script that iterates the entire STAC catalog and writes all GeoTIFF asset
-URLs to a text file. Useful for spot-checking URLs or diagnosing issues with asset
-hrefs across the catalog. Not part of the normal pipeline.
-
----
-
 
 ### Documentation
 
